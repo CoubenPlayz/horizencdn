@@ -1203,5 +1203,183 @@ window.onload=async()=>{
   loadAppStore();fetchWeather();
 };
 </script>
+<script>
+   /* ================================================================
+   HORIZEN OS  <->  HORIZENMESSAGES BRIDGE
+   Paste inside a new <script> tag right before </body> in Horizen OS.
+   Shows popup notifications (with Answer / Decline for calls) for
+   messages and calls that arrive in HorizenMessages.
+   ================================================================ */
+(function(){
+'use strict';
+
+/* ---------- DATABASE KEYS (HorizenMessages Supabase project) ---------- */
+const MSG_URL='https://uwpcgccammspgzocjsco.supabase.co';
+const MSG_KEY='sb_publishable_VovyqA7vY-IVd2qke-sCRg_l1LdpMMV';
+const MSG_APP='https://messages.horizensearch.com';   /* where HorizenMessages is hosted */
+
+const mb=supabase.createClient(MSG_URL,MSG_KEY,{auth:{storageKey:'hz_messages_auth'}});
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+let me=null,started=false,P={},convs={},rings={},chans={},dbCh=null,sigCh=null,audioCtx=null,ringTimer=null;
+const nm=id=>(P[id]&&P[id].username)||'Someone';
+
+/* ---------- UI: styles, popup stack, login modal, menu item ---------- */
+const style=document.createElement('style');
+style.textContent=`
+#mb-stack{position:fixed;top:60px;right:14px;z-index:80000;display:flex;flex-direction:column;gap:10px;width:330px;max-width:calc(100vw - 28px);pointer-events:none}
+.mb-card{pointer-events:auto;cursor:pointer;background:rgba(14,14,14,.97);border:1px solid rgba(0,235,132,.35);border-radius:16px;padding:12px 14px;box-shadow:0 12px 40px rgba(0,0,0,.7);backdrop-filter:blur(20px);animation:slideInRight .3s ease}
+.mb-card.mb-call{border-color:rgba(0,235,132,.8);cursor:default}
+.mb-row{display:flex;align-items:center;gap:12px}
+.mb-av{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,var(--accent),#00a86b);color:#000;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.mb-txt{flex:1;min-width:0}
+.mb-t{font-size:13px;font-weight:700;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mb-b{font-size:12px;color:#aaa;margin-top:2px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;word-break:break-word}
+.mb-x{background:none;border:none;color:#666;font-size:18px;cursor:pointer;align-self:flex-start}
+.mb-x:hover{color:#fff}
+.mb-btns{display:flex;gap:8px;margin-top:10px}
+.mb-btns button{flex:1;padding:9px;border:none;border-radius:10px;font-weight:700;font-size:12px;cursor:pointer;font-family:inherit}
+.mb-ans{background:var(--accent);color:#000}
+.mb-dec{background:#ff4d6a;color:#fff}`;
+document.head.appendChild(style);
+
+const stack=document.createElement('div');stack.id='mb-stack';document.body.appendChild(stack);
+
+const modal=document.createElement('div');modal.id='mb-login-modal';modal.className='modal-base';
+modal.innerHTML=`<div class="modal-card">
+  <h3><i class="fas fa-comments" style="color:var(--accent);"></i> Messages Sign-In</h3>
+  <div class="modal-sub">Use your HorizenMessages email and password</div>
+  <div class="form-field"><label>Email</label><input type="email" id="mb-email" autocomplete="email"></div>
+  <div class="form-field"><label>Password</label><input type="password" id="mb-pass" autocomplete="current-password"></div>
+  <div class="form-error" id="mb-err"></div>
+  <div class="modal-actions"><button class="btn-cancel" id="mb-cancel">Cancel</button><button class="btn-primary" id="mb-go">Sign In</button></div>
+</div>`;
+document.body.appendChild(modal);
+
+const item=document.createElement('div');item.className='fp-popup-item';item.id='mb-menu-item';
+$('fp-popup').appendChild(item);
+function paintMenu(){item.innerHTML='<i class="fas fa-comments"></i> '+(me?'Messages: '+esc(nm(me.id))+' (sign out)':'Messages Sign-In');}
+item.onclick=()=>{$('fp-popup').classList.remove('open');if(me)logout();else{$('mb-err').style.display='none';modal.classList.add('open');setTimeout(()=>$('mb-email').focus(),100);}};
+$('mb-cancel').onclick=()=>modal.classList.remove('open');
+modal.addEventListener('click',e=>{if(e.target===modal)modal.classList.remove('open')});
+$('mb-pass').addEventListener('keypress',e=>{if(e.key==='Enter')login()});
+$('mb-go').onclick=login;
+
+/* ---------- Popups, sound, browser notifications ---------- */
+function popup(o){
+  const el=document.createElement('div');el.className='mb-card'+(o.call?' mb-call':'');
+  el.innerHTML='<div class="mb-row"><div class="mb-av">'+esc((o.title||'?')[0].toUpperCase())+'</div><div class="mb-txt"><div class="mb-t">'+esc(o.title)+'</div><div class="mb-b">'+esc(o.body)+'</div></div><button class="mb-x" title="Dismiss">&times;</button></div>'
+    +(o.call?'<div class="mb-btns"><button class="mb-ans">Answer</button><button class="mb-dec">Decline</button></div>':'');
+  const close=()=>{clearTimeout(el._t);el.remove()};
+  el.close=close;
+  el.querySelector('.mb-x').onclick=e=>{e.stopPropagation();close();o.onDismiss&&o.onDismiss()};
+  if(o.call){
+    el.querySelector('.mb-ans').onclick=()=>{close();o.onAnswer()};
+    el.querySelector('.mb-dec').onclick=()=>{close();o.onDecline()};
+  }else el.onclick=()=>{close();o.onOpen&&o.onOpen()};
+  stack.appendChild(el);
+  el._t=setTimeout(()=>{close();o.onDismiss&&o.onDismiss()},o.ms||6000);
+  return el;
+}
+function beep(){try{audioCtx=audioCtx||new(window.AudioContext||window.webkitAudioContext)();const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.frequency.value=880;g.gain.value=.08;o.connect(g);g.connect(audioCtx.destination);o.start();o.stop(audioCtx.currentTime+.25);}catch(e){}}
+function startRing(){stopRing();beep();ringTimer=setInterval(beep,1500)}
+function stopRing(){clearInterval(ringTimer);ringTimer=null}
+function notifyOS(title,body,tag){
+  if(!document.hidden||!('Notification' in window)||Notification.permission!=='granted')return;
+  const n=new Notification(title,{body,tag});n.onclick=()=>{window.focus();n.close()};
+}
+
+/* ---------- Open / find the HorizenMessages tab ---------- */
+function msgTab(){
+  for(const f of document.querySelectorAll('#viewport .view-pane iframe')){
+    if((f.src||'').indexOf(MSG_APP)===0){const pane=f.closest('.view-pane');return{id:pane.id.replace('view-',''),active:pane.classList.contains('active')};}
+  }
+  return null;
+}
+function openMessages(hash){
+  const t=msgTab();
+  if(t){switchTab(t.id);return}
+  openUrl(MSG_APP+(hash||''),'HorizenMessages');
+}
+
+/* ---------- Incoming messages ---------- */
+async function loadMeta(){
+  const [a,b]=await Promise.all([mb.from('profiles').select('id,username'),mb.from('conversations').select('id,name,is_group')]);
+  (a.data||[]).forEach(p=>P[p.id]=p);(b.data||[]).forEach(c=>convs[c.id]=c);
+}
+async function onMsg(m){
+  if(!me||m.sender_id===me.id||m.deleted)return;
+  if(!convs[m.conversation_id]||!P[m.sender_id]){await loadMeta();if(!convs[m.conversation_id])return}
+  if(!m.body&&!m.file_name)return;
+  if(msgTab()&&msgTab().active)return;           /* you're already looking at Messages */
+  const c=convs[m.conversation_id],g=c.is_group;
+  const title=g?c.name:nm(m.sender_id);
+  const body=(g?nm(m.sender_id)+': ':'')+(m.body||'📎 '+(m.file_name||'File'));
+  popup({title,body:body.slice(0,140),ms:7000,onOpen:()=>openMessages('#chat='+m.conversation_id)});
+  beep();notifyOS(title,body,'m-'+m.conversation_id);
+}
+
+/* ---------- Incoming calls (WebRTC signals over Realtime broadcast) ---------- */
+function sendSig(to,payload){
+  const ch=chans[to]||(chans[to]=new Promise(r=>{const c=mb.channel('u:'+to);c.subscribe(s=>{if(s==='SUBSCRIBED')r(c)})}));
+  return ch.then(c=>c.send({type:'broadcast',event:'sig',payload:Object.assign({},payload,{from:me.id})}));
+}
+function ringDone(from){if(rings[from]){rings[from].close();delete rings[from]}if(!Object.keys(rings).length)stopRing()}
+async function onSig(p){
+  if(!me||!p)return;
+  if(p.t==='offer'){
+    if(msgTab()&&msgTab().active)return;          /* Messages shows its own call screen */
+    if(!P[p.from])await loadMeta();
+    ringDone(p.from);
+    const kind=p.video?'Incoming video call':'Incoming voice call';
+    rings[p.from]=popup({title:nm(p.from),body:kind,call:true,ms:45000,
+      onAnswer:()=>{ringDone(p.from);openMessages('#sig='+encodeURIComponent(btoa(JSON.stringify({p,at:Date.now()}))))},
+      onDecline:()=>{ringDone(p.from);sendSig(p.from,{t:'end'})},
+      onDismiss:()=>ringDone(p.from)});
+    startRing();notifyOS(nm(p.from),kind,'call-'+p.from);
+  }else if(p.t==='end')ringDone(p.from);
+}
+
+/* ---------- Auth + lifecycle ---------- */
+async function startBridge(user){
+  if(started)return;started=true;me=user;
+  await loadMeta();paintMenu();
+  dbCh=mb.channel('os-db')
+    .on('postgres_changes',{event:'INSERT',schema:'public',table:'messages'},p=>onMsg(p.new))
+    .on('postgres_changes',{event:'INSERT',schema:'public',table:'conversation_members'},()=>loadMeta())
+    .subscribe();
+  sigCh=mb.channel('u:'+me.id).on('broadcast',{event:'sig'},({payload})=>onSig(payload)).subscribe();
+  document.addEventListener('click',()=>{if('Notification' in window&&Notification.permission==='default')Notification.requestPermission()},{once:true});
+}
+function teardown(){
+  if(dbCh)mb.removeChannel(dbCh);if(sigCh)mb.removeChannel(sigCh);
+  dbCh=sigCh=null;chans={};rings={};stopRing();stack.innerHTML='';
+  started=false;me=null;P={};convs={};paintMenu();
+}
+async function approved(uid){const {data}=await mb.from('approved_acounts').select('user_id').eq('user_id',uid).maybeSingle();return !!data}
+async function login(){
+  const email=$('mb-email').value.trim(),pw=$('mb-pass').value,err=$('mb-err'),btn=$('mb-go');
+  const fail=t=>{err.textContent=t;err.style.display='block';btn.disabled=false;btn.textContent='Sign In'};
+  if(!email||!pw)return fail('Enter your email and password');
+  btn.disabled=true;btn.textContent='Signing in...';err.style.display='none';
+  const {data,error}=await mb.auth.signInWithPassword({email,password:pw});
+  if(error)return fail(error.message);
+  if(!(await approved(data.user.id))){await mb.auth.signOut({scope:'local'});return fail('Your Messages account isn\u2019t confirmed yet. Check your email.')}
+  modal.classList.remove('open');$('mb-pass').value='';btn.disabled=false;btn.textContent='Sign In';
+  await startBridge(data.user);showToast('You\u2019ll get message and call popups now','Messages','💬');
+}
+async function logout(){await mb.auth.signOut();teardown();showToast('Signed out of Messages','Messages','👋')}
+
+mb.auth.onAuthStateChange(e=>{if(e==='SIGNED_OUT'&&started)teardown()});
+async function init(){
+  paintMenu();
+  const {data:{session}}=await mb.auth.getSession();
+  if(!session)return;
+  if(await approved(session.user.id))startBridge(session.user);else await mb.auth.signOut({scope:'local'});
+}
+if(document.readyState==='complete')init();else window.addEventListener('load',init);
+})();
+<script>
 </body>
 </html>
